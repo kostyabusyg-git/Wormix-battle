@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Worms Mini — Supabase</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, sans-serif;
+    background: #1b2430; color: #e6edf3;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 16px;
+  }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .panel {
+    background: #232f3e; border-radius: 12px; padding: 14px;
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    margin-bottom: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.3);
+  }
+  button {
+    background: #3b82f6; color: white; border: none; border-radius: 8px;
+    padding: 8px 14px; font-size: 14px; cursor: pointer; font-weight: 600;
+  }
+  button:disabled { background: #4b5563; cursor: not-allowed; }
+  button.secondary { background: #475569; }
+  input {
+    background: #0f172a; border: 1px solid #334155; border-radius: 8px;
+    color: #e6edf3; padding: 8px 10px; font-size: 14px; width: 220px;
+  }
+  #status { font-size: 13px; opacity: .8; margin-left: 4px; }
+  canvas {
+    background: linear-gradient(#87ceeb, #b0e0e6);
+    border-radius: 12px; display: block; touch-action: none;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+    max-width: 100%;
+  }
+  .hud {
+    display: flex; gap: 24px; margin-top: 10px; font-size: 14px;
+    background: #232f3e; padding: 10px 18px; border-radius: 10px;
+  }
+  .hud b { color: #fbbf24; }
+  .turn-you { color: #34d399; font-weight: 700; }
+  .turn-enemy { color: #f87171; font-weight: 700; }
+</style>
+</head>
+<body>
+  <h1>🪱 Worms Mini (Supabase Realtime)</h1>
+
+  <div class="panel">
+    <input id="roomInput" placeholder="ID комнаты (например, room-1)" value="room-1" />
+    <button id="createBtn">Создать комнату</button>
+    <button id="joinBtn" class="secondary">Присоединиться</button>
+    <span id="status">не подключено</span>
+  </div>
+
+  <canvas id="game" width="900" height="500"></canvas>
+
+  <div class="hud">
+    <span>Ты: <b id="myHp">100</b> HP</span>
+    <span>Враг: <b id="enemyHp">100</b> HP</span>
+    <span id="turnIndicator">—</span>
+  </div>
+
+  <!-- Supabase JS -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+  // ================== НАСТРОЙКИ ==================
+  const SUPABASE_URL = "https://hzquoypjuzrylhmusbam.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh6cXVveXBqdXpyeWxobXVzYmFtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2NzUwMDAsImV4cCI6MjEwODI1MTAwMH0.fxjyyV27EHsir52kXxEwxOlEjU0KVVLg_JSzEteYKL4";
+
+  const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  // ================== СОСТОЯНИЕ ИГРЫ ==================
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  const W = canvas.width;
+  const H = canvas.height;
+  const GROUND_Y = H - 60; // уровень земли
+
+  // Игрок = объект { id, side: 'left'|'right', hp, x }
+  const state = {
+    roomId: null,
+    mySide: null,          // 'left' | 'right'
+    myHp: 100,
+    enemyHp: 100,
+    turn: null,            // 'left' | 'right' — чей сейчас ход
+    wind: 0,
+    projectile: null,      // { x, y, vx, vy, owner }
+    winner: null,
+    connected: false,
+  };
+
+  // Червяки: левый и правый. Рисуем их всегда в фиксированных точках.
+  const worms = {
+    left:  { x: 150, y: GROUND_Y, color: "#22c55e", name: "Левый" },
+    right: { x: W - 150, y: GROUND_Y, color: "#ef4444", name: "Правый" },
+  };
+
+  // ================== UI ==================
+  const statusEl = document.getElementById("status");
+  const myHpEl = document.getElementById("myHp");
+  const enemyHpEl = document.getElementById("enemyHp");
+  const turnEl = document.getElementById("turnIndicator");
+  const roomInput = document.getElementById("roomInput");
+
+  function updateHud() {
+    myHpEl.textContent = state.myHp;
+    enemyHpEl.textContent = state.enemyHp;
+    if (state.winner) {
+      turnEl.textContent = state.winner === state.mySide ? "🏆 Ты победил!" : "💀 Ты проиграл";
+    } else if (!state.connected) {
+      turnEl.textContent = "Не в игре";
+    } else if (state.turn === state.mySide) {
+      turnEl.innerHTML = '<span class="turn-you">Твой ход — кликни по полю</span>';
+    } else {
+      turnEl.innerHTML = '<span class="turn-enemy">Ход врага…</span>';
+    }
+  }
+
+  // ================== ОТРИСОВКА ==================
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Земля
+    ctx.fillStyle = "#8b5a2b";
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    ctx.fillStyle = "#2e7d32";
+    ctx.fillRect(0, GROUND_Y, W, 10);
+
+    // Червяки
+    for (const side of ["left", "right"]) {
+      const w = worms[side];
+      ctx.fillStyle = w.color;
+      ctx.beginPath();
+      ctx.arc(w.x, w.y - 18, 16, 0, Math.PI * 2);
+      ctx.fill();
+      // глаза
+      ctx.fillStyle = "#111";
+      ctx.beginPath();
+      ctx.arc(w.x - 5, w.y - 22, 2.5, 0, Math.PI * 2);
+      ctx.arc(w.x + 5, w.y - 22, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      // имя
+      ctx.fillStyle = "#fff";
+      ctx.font = "12px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText(w.name, w.x, w.y + 25);
+    }
+
+    // Снаряд
+    if (state.projectile) {
+      ctx.fillStyle = "#f97316";
+      ctx.beginPath();
+      ctx.arc(state.projectile.x, state.projectile.y, 7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Ветер / подсказка
+    ctx.fillStyle = "rgba(0,0,0,.5)";
+    ctx.font = "14px system-ui";
+    ctx.textAlign = "left";
+    ctx.fillText(`Ветер: ${state.wind.toFixed(1)}`, 12, 24);
+
+    requestAnimationFrame(draw);
+  }
+  draw();
+
+  // ================== СЕТЬ ==================
+  let channel = null;
+
+  function makePlayerId() {
+    let id = localStorage.getItem("worms_player_id");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("worms_player_id", id);
+    }
+    return id;
+  }
+  const MY_ID = makePlayerId();
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  // Создать комнату: пишем строку со status=waiting
+  async function createRoom(roomId) {
+    if (!SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.startsWith("ВСТАВЬ")) {
+      setStatus("⚠️ Вставь anon key в код!");
+      return;
+    }
+    const { error } = await supabase.from("game_rooms").insert({
+      id: roomId,
+      host_id: MY_ID,
+      status: "waiting",
+      game_state: {
+        hp: { [MY_ID]: 100 },
+        turn: null,
+        wind: randomWind(),
+      },
+    });
+    if (error) {
+      setStatus("Ошибка создания: " + error.message);
+      return;
+    }
+    state.roomId = roomId;
+    state.mySide = "left";
+    state.turn = "left";
+    setStatus("Комната создана. Ждём друга…");
+    await subscribeRoom(roomId);
+  }
+
+  // Присоединиться: обновляем строку, ставим guest
+  async function joinRoom(roomId) {
+    if (!SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.startsWith("ВСТАВЬ")) {
+      setStatus("⚠️ Вставь anon key в код!");
+      return;
+    }
+    const { data, error } = await supabase
+      .from("game_rooms")
+      .select("*")
+      .eq("id", roomId)
+      .single();
+
+    if (error || !data) {
+      setStatus("Комната не найдена");
+      return;
+    }
+    if (data.guest_id && data.guest_id !== MY_ID) {
+      setStatus("Комната уже занята");
+      return;
+    }
+
+    const newHp = { ...(data.game_state?.hp || {}), [MY_ID]: 100 };
+    const { error: updErr } = await supabase
+      .from("game_rooms")
+      .update({
+        guest_id: MY_ID,
+        status: "playing",
+        game_state: {
+          ...data.game_state,
+          hp: newHp,
+          turn: data.game_state?.turn || "left",
+        },
+      })
+      .eq("id", roomId);
+
+    if (updErr) {
+      setStatus("Ошибка входа: " + updErr.message);
+      return;
+    }
+
+    state.roomId = roomId;
+    state.mySide = "right";
+    setStatus("Ты присоединился. Ждём хода хоста…");
+    await subscribeRoom(roomId);
+  }
+
+  function randomWind() {
+    return Math.round((Math.random() * 8 - 4) * 10) / 10;
+  }
+
+  // Подписка на изменения строки комнаты
+  async function subscribeRoom(roomId) {
+    if (channel) supabase.removeChannel(channel);
+
+    // Загружаем актуальное состояние сразу
+    const { data } = await supabase.from("game_rooms").select("*").eq("id", roomId).single();
+    if (data) applyServerState(data);
+
+    channel = supabase
+      .channel("room:" + roomId)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "game_rooms", filter: `id=eq.${roomId}` },
+        (payload) => {
+          if (payload.new) applyServerState(payload.new);
+        }
+      )
+      .subscribe((s) => {
+        if (s === "SUBSCRIBED") {
+          state.connected = true;
+          setStatus("Подключено к комнате " + roomId);
+          updateHud();
+        }
+      });
+  }
+
+  // Применяем состояние из базы к локальному
+  function applyServerState(row) {
+    state.roomId = row.id;
+
+    // Определяем свою сторону, если ещё не знаем
+    if (!state.mySide) {
+      if (row.host_id === MY_ID) state.mySide = "left";
+      else if (row.guest_id === MY_ID) state.mySide = "right";
+    }
+
+    const gs = row.game_state || {};
+    const hp = gs.hp || {};
+    const enemyId = state.mySide === "left" ? row.guest_id : row.host_id;
+
+    state.myHp = hp[MY_ID] ?? 100;
+    state.enemyHp = enemyId ? (hp[enemyId] ?? 100) : 100;
+    state.turn = gs.turn || null;
+    state.wind = gs.wind ?? 0;
+    state.winner = gs.winner || null;
+
+    if (gs.projectile) state.projectile = gs.projectile;
+
+    // Если гость зашёл — у хоста статус меняется на playing
+    if (row.status === "playing") state.connected = true;
+
+    updateHud();
+  }
+
+  // ================== ХОД ИГРОКА (ВЫСТРЕЛ) ==================
+  // Упрощённо: клик по полю = выстрел в эту точку.
+  // Считаем урон локально, отправляем результат в базу.
+  canvas.addEventListener("pointerdown", async (e) => {
+    if (!state.connected || state.winner) return;
+    if (state.turn !== state.mySide) return; // не твой ход
+    if (!state.roomId) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = W / rect.width;
+    const scaleY = H / rect.height;
+    const tx = (e.clientX - rect.left) * scaleX;
+    const ty = (e.clientY - rect.top) * scaleY;
+
+    // Моя стартовая точка
+    const from = worms[state.mySide];
+    const to = worms[state.mySide === "left" ? "right" : "left"];
+
+    // Траектория с учётом ветра (простая парабола по направлению к цели)
+    // Здесь мы "телепортируем" снаряд сразу к точке клика для простоты сети.
+    const hitX = Math.max(0, Math.min(W, tx));
+    const hitY = Math.max(0, Math.min(GROUND_Y, ty));
+
+    // Попадание: расстояние до врага
+    const dist = Math.hypot(hitX - to.x, hitY - (to.y - 18));
+    const HIT_RADIUS = 40;
+    let damage = 0;
+    if (dist < HIT_RADIUS) {
+      damage = Math.round(30 * (1 - dist / HIT_RADIUS));
+    }
+
+    // Собираем новое состояние
+    const enemyId = state.mySide === "left" ? undefined : undefined;
+    // Получим актуальную строку, чтобы не затереть чужое
+    const { data: row } = await supabase.from("game_rooms").select("*").eq("id", state.roomId).single();
+    if (!row) return;
+
+    const gs = row.game_state || {};
+    const hp = gs.hp || {};
+    const enemyPlayerId = state.mySide === "left" ? row.guest_id : row.host_id;
+
+    if (!enemyPlayerId) return;
+
+    const newEnemyHp = Math.max(0, (hp[enemyPlayerId] ?? 100) - damage);
+    const newHp = { ...hp, [enemyPlayerId]: newEnemyHp };
+
+    let winner = null;
+    if (newEnemyHp <= 0) winner = state.mySide;
+
+    const nextTurn = state.mySide === "left" ? "right" : "left";
+    const newWind = randomWind();
+
+    const newState = {
+      ...gs,
+      hp: newHp,
+      turn: winner ? null : nextTurn,
+      wind: newWind,
+      winner,
+      projectile: { x: hitX, y: hitY, owner: state.mySide }, // для визуала у врага
+    };
+
+    const { error } = await supabase
+      .from("game_rooms")
+      .update({ game_state: newState, status: winner ? "finished" : "playing" })
+      .eq("id", state.roomId);
+
+    if (error) {
+      setStatus("Ошибка хода: " + error.message);
+      return;
+    }
+
+    // Локально применяем сразу
+    state.myHp = hp[MY_ID] ?? state.myHp;
+    state.enemyHp = newEnemyHp;
+    state.turn = winner ? null : nextTurn;
+    state.wind = newWind;
+    state.winner = winner;
+
+    // Через 500 мс убираем снаряд (визуально)
+    setTimeout(() => {
+      state.projectile = null;
+    }, 500);
+
+    updateHud();
+  });
+
+  // ================== КНОПКИ ==================
+  document.getElementById("createBtn").onclick = () => {
+    const id = roomInput.value.trim() || "room-1";
+    createRoom(id);
+  };
+  document.getElementById("joinBtn").onclick = () => {
+    const id = roomInput.value.trim() || "room-1";
+    joinRoom(id);
+  };
+
+  // ================== СТАРТ ==================
+  if (SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.startsWith("ВСТАВЬ")) {
+    setStatus("Готово. Создай или присоединись к комнате.");
+  } else {
+    setStatus("⚠️ Вставь anon key в код!");
+  }
+  updateHud();
+  </script>
+</body>
+</html>
